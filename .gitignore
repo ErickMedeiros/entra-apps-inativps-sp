@@ -1,0 +1,23 @@
+# Secrets e credenciais - NUNCA versionar
+*.secret
+*.pfx
+*.cer
+*.pem
+*.key
+secrets.*
+.env
+.env.*
+
+# Saidas locais de teste
+apps-inativos-*.csv
+*.log
+output/
+temp/
+
+# Artefatos de IDE / SO
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
