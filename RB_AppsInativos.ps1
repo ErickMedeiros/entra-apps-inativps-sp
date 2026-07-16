@@ -4,11 +4,15 @@
     relatorio (HTML + CSV anexo) por email para um grupo de administradores.
 
 .DESCRIPTION
-    Abordagem HIBRIDA:
-    - Inventario completo dos apps via Microsoft Graph (Get-MgApplication).
-    - Ultimo sign-in real via Log Analytics (KQL sobre AADServicePrincipalSignInLogs).
+    Abordagem 100% Microsoft Graph (sem Log Analytics):
+    - Inventario completo dos apps via Get-MgApplication.
+    - Ultimo sign-in por app via relatorio servicePrincipalSignInActivities (beta).
     Cruza por AppId e classifica: Ativo / Inativo / Nunca logou.
     Avalia tambem credenciais (Atual / Expirando em breve / Expirado).
+
+    Vantagem sobre Log Analytics: roda no proprio tenant do app (sem cross-tenant),
+    usa AuditLog.Read.All (ja concedida) e dispensa workspace/Diagnostic Settings.
+    O relatorio e beta e tem latencia de horas/dias (ok para janelas de 30/90 dias).
 
     AUTENTICACAO: Service Principal, com DUAS alternativas selecionaveis por -AuthMode:
       - 'Secret'      : client_credentials com client secret.
@@ -50,29 +54,30 @@
     UPN da mailbox que envia o email. Deve ter licenca Exchange Online ativa.
 
 .PARAMETER Destinatario
-    Endereco que recebe o relatorio. Pode ser caixa individual ou DL.
+    Um ou mais enderecos que recebem o relatorio, separados por virgula ou
+    ponto-e-virgula. Ex.: "a@x.com,b@y.com". Pode ser caixa individual ou DL.
 
 .PRE-REQUISITOS
     Modulos (runtime 7.2): Microsoft.Graph.Authentication, Microsoft.Graph.Applications
     Permissoes de APLICACAO do SP (Graph), com admin consent:
         Application.Read.All, Directory.Read.All, AuditLog.Read.All, Mail.Send
-    RBAC: Log Analytics Reader no workspace (atribuido ao SP).
-    Diagnostic Setting do Entra enviando SignInLogs/ServicePrincipalSignInLogs ao workspace.
+    Licenca Microsoft Entra ID P1 ou P2 (necessaria para o relatorio de sign-in).
+    NAO precisa mais de workspace Log Analytics, RBAC nem Diagnostic Settings.
 
 .NOTES
     Autor:   Equipe de Identidade
-    Versao:  2.1  (Service Principal: secret OU certificado)
+    Versao:  2.3  (sign-in via Graph report; sem Log Analytics)
     Runtime: PowerShell 7.2 (Azure Automation sandbox)
 #>
 
 param(
-    [int]    $DiasSemUso        = 90,
+    [int]    $DiasSemUso        = 30,
 
     # Vazio => resolve via Automation Variable 'AppGov-AuthMode'; senao 'Secret'.
     [string] $AuthMode          = "",
 
-    [string] $TenantId          = "<TENANT_ID>",
-    [string] $ClientId          = "<CLIENT_ID_DO_SERVICE_PRINCIPAL>",
+    [string] $TenantId          = "",
+    [string] $ClientId          = "",
 
     # --- AuthMode = Secret ---
     [string] $ClientSecret      = "",
@@ -83,9 +88,10 @@ param(
     [string] $CertificateThumbprint = "",
 
     # --- Comum ---
-    [string] $WorkspaceId       = "<WORKSPACE_CUSTOMER_ID>",
-    [string] $Remetente         = "automation@suaempresa.com",
-    [string] $Destinatario      = "admins@suaempresa.com"
+    # WorkspaceId: legado (nao usado nesta versao; sign-in vem do Graph report).
+    [string] $WorkspaceId       = "",
+    [string] $Remetente         = "email-remetente",
+    [string] $Destinatario      = "email-desinatário,separadoporvirgula"
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,9 +114,8 @@ function Resolve-Config {
     }
 }
 
-$TenantId    = Resolve-Config -Value $TenantId    -VariableName "AppGov-TenantId"
-$ClientId    = Resolve-Config -Value $ClientId    -VariableName "AppGov-ClientId"
-$WorkspaceId = Resolve-Config -Value $WorkspaceId -VariableName "AppGov-WorkspaceId"
+$TenantId    = Resolve-Config -Value $TenantId -VariableName "AppGov-TenantId"
+$ClientId    = Resolve-Config -Value $ClientId -VariableName "AppGov-ClientId"
 
 # Resolver AuthMode: parametro explicito > Automation Variable 'AppGov-AuthMode' > 'Secret'
 if ([string]::IsNullOrWhiteSpace($AuthMode)) {
@@ -242,36 +247,51 @@ else {
 Write-Output "Conectado ao Microsoft Graph como Service Principal (app-only)."
 
 # ============================================================
-# 3. Ultimo login via Log Analytics (REST + token do SP)
+# 3. Ultimo login por app via Graph (servicePrincipalSignInActivities, beta)
+#    Substitui o Log Analytics: mesma autenticacao (Graph), sem cross-tenant.
+#    Requer AuditLog.Read.All (aplicacao) + Entra ID P1/P2.
+#    Para cada app pega a data mais recente entre os tipos de sign-in.
 # ============================================================
 $signInPorAppId = @{}
 try {
-    $tokenLA = Get-EntraToken -Resource "https://api.loganalytics.io"
+    $tokenRep = Get-EntraToken -Resource "https://graph.microsoft.com"
+    $uri = 'https://graph.microsoft.com/beta/reports/servicePrincipalSignInActivities'
 
-    $kql = @"
-union isfuzzy=true
-    (AADServicePrincipalSignInLogs | summarize UltimoLogin = max(TimeGenerated) by AppId),
-    (SigninLogs | summarize UltimoLogin = max(TimeGenerated) by AppId)
-| summarize UltimoLogin = max(UltimoLogin) by AppId
-"@
+    $paginas = 0
+    $totalItens = 0
+    do {
+        $resp = Invoke-RestMethod -Method GET -Uri $uri `
+            -Headers @{ Authorization = "Bearer $tokenRep" }
 
-    $body = @{ query = $kql } | ConvertTo-Json
-    $laResp = Invoke-RestMethod -Method POST `
-        -Uri "https://api.loganalytics.io/v1/workspaces/$WorkspaceId/query" `
-        -Headers @{ Authorization = "Bearer $tokenLA"; "Content-Type" = "application/json" } `
-        -Body $body
+        $totalItens += @($resp.value).Count
+        foreach ($item in $resp.value) {
+            $appId = $item.appId
+            if (-not $appId) { continue }
 
-    $cols   = $laResp.tables[0].columns.name
-    $idxApp = [array]::IndexOf($cols, "AppId")
-    $idxLog = [array]::IndexOf($cols, "UltimoLogin")
-    foreach ($row in $laResp.tables[0].rows) {
-        $appId = $row[$idxApp]; $login = $row[$idxLog]
-        if ($appId -and $login) { $signInPorAppId["$appId"] = [datetime]$login }
-    }
-    Write-Output "Log Analytics: ultimo login carregado para $($signInPorAppId.Count) apps."
+            $datas = @(
+                $item.lastSignInActivity.lastSignInDateTime
+                $item.applicationAuthenticationClientSignInActivity.lastSignInDateTime
+                $item.delegatedClientSignInActivity.lastSignInDateTime
+            ) | Where-Object { $_ } | ForEach-Object { [datetime]$_ }
+
+            if ($datas) {
+                $maisRecente = $datas | Sort-Object -Descending | Select-Object -First 1
+                $atual = $signInPorAppId["$appId"]
+                if (-not $atual -or $maisRecente -gt $atual) {
+                    $signInPorAppId["$appId"] = $maisRecente
+                }
+            }
+        }
+
+        $uri = $resp.'@odata.nextLink'
+        $paginas++
+    } while ($uri -and $paginas -lt 50)
+
+    Write-Output "Sign-in (Graph report): $totalItens itens no relatorio; ultimo login mapeado para $($signInPorAppId.Count) apps."
 }
 catch {
-    Write-Warning "Falha ao consultar Log Analytics: $($_.Exception.Message)"
+    Write-Warning "Falha ao consultar servicePrincipalSignInActivities: $($_.Exception.Message)"
+    Write-Warning "Details: $($_.ErrorDetails.Message)"
 }
 
 # ============================================================
@@ -345,7 +365,7 @@ $linhas = foreach ($c in $candidatos) {
 
 $html = @"
 <html><body style='font-family:Segoe UI,Arial,sans-serif;color:#252525'>
-<h2 style='color:#0078d4'>Relatorio de Aplicativos Inativos - Microsoft Entra ID</h2>
+<h2 style='color:#0078d4'>Sotreq - Relatorio de Aplicativos Inativos - Microsoft Entra ID</h2>
 <p>Identificados <b>$($candidatos.Count)</b> aplicativos inativos ou nunca logados
 (janela de <b>$DiasSemUso dias</b>).</p>
 <p>Veja a tabela abaixo e o CSV anexo com a lista completa.</p>
@@ -378,12 +398,31 @@ Write-Output "CSV gerado: $($candidatos.Count) linhas, $($csvBytes.Length) bytes
 
 # ============================================================
 # 8. Montar mensagem com anexo
+#    Destinatario aceita varios enderecos separados por virgula ou ponto-e-virgula.
+#    Cada endereco vira um item em toRecipients (senao o Graph tenta resolver a
+#    string inteira como um unico endereco -> ErrorInvalidRecipients).
 # ============================================================
+$listaDestinatarios = $Destinatario -split '[;,]' |
+    ForEach-Object { $_.Trim() } |
+    Where-Object   { $_ }
+
+if (-not $listaDestinatarios) {
+    throw "Nenhum destinatario valido em -Destinatario."
+}
+
+$toRecipients = @(
+    foreach ($addr in $listaDestinatarios) {
+        @{ emailAddress = @{ address = $addr } }
+    }
+)
+
+Write-Output "Destinatarios ($($listaDestinatarios.Count)): $($listaDestinatarios -join ', ')"
+
 $mensagem = @{
     message = @{
         subject      = "[Entra ID] $($candidatos.Count) aplicativos inativos (>= $DiasSemUso dias)"
         body         = @{ contentType = "HTML"; content = $html }
-        toRecipients = @( @{ emailAddress = @{ address = $Destinatario } } )
+        toRecipients = $toRecipients
         attachments  = @(
             @{
                 "@odata.type" = "#microsoft.graph.fileAttachment"
@@ -411,7 +450,7 @@ try {
         -Headers @{ Authorization = "Bearer $tokenGraph"; "Content-Type" = "application/json; charset=utf-8" } `
         -Body $bodyBytes
 
-    Write-Output "Email enviado para $Destinatario com anexo $csvNome."
+    Write-Output "Email enviado para $($listaDestinatarios.Count) destinatario(s) com anexo $csvNome."
 }
 catch {
     Write-Warning "Falha ao enviar email: $($_.Exception.Message)"
