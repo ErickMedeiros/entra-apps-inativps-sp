@@ -365,7 +365,7 @@ $linhas = foreach ($c in $candidatos) {
 
 $html = @"
 <html><body style='font-family:Segoe UI,Arial,sans-serif;color:#252525'>
-<h2 style='color:#0078d4'>Sotreq - Relatorio de Aplicativos Inativos - Microsoft Entra ID</h2>
+<h2 style='color:#0078d4'>Relatorio de Aplicativos Inativos - Microsoft Entra ID</h2>
 <p>Identificados <b>$($candidatos.Count)</b> aplicativos inativos ou nunca logados
 (janela de <b>$DiasSemUso dias</b>).</p>
 <p>Veja a tabela abaixo e o CSV anexo com a lista completa.</p>
